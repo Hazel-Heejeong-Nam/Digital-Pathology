@@ -52,9 +52,9 @@ def save_patch(args, destination, key):
             RandRotate90d(keys=["image"], prob=0.5),
             ToNumpyd(keys=["image"], dtype = np.float16 ),
         ]
-    )
+    ) 
 
-    data_tr = Dataset(data=dataset, transform=transform)
+    data_tr =  Dataset(data=dataset, transform=transform)
 
     for i in range(len(data_tr)):
         start_time = time.time()
