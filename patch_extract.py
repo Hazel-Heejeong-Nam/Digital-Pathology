@@ -58,7 +58,7 @@ def save_patch(args, destination, key):
 
     for i in range(len(data_tr)):
         start_time = time.time()
-        wsi = data_tr.__getitem__(i)
+        wsi =  data_tr.__getitem__(i)
         for j in range(len(wsi)):
             slide = wsi[j]["image"].reshape((1, 3, args.tile_size, args.tile_size))
             if j==0 :
