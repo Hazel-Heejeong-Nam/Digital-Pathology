@@ -67,8 +67,7 @@ python3 preprocessing_mp.py --saveimg
   > Search foreground only in ROI bounding box
   > 
   > Return stacked patch in shape of (N,C,H,W) and the format is npy
-  > 
-  > ![image](https://user-images.githubusercontent.com/100391059/200584168-2143e732-7ed1-4024-9b96-e3a1dd24092c.png)
+
  
   - hard_threshold_patch
   > Move to high-resolution image and find foreground patches using fixed value
