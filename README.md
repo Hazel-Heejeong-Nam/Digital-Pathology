@@ -65,15 +65,19 @@ python3 preprocessing_mp.py --saveimg
   > Search foreground only in ROI bounding box
   > 
   > Return stacked patch in shape of (N,C,H,W) and the format is npy
+  > 
   > ![image](https://user-images.githubusercontent.com/100391059/200584168-2143e732-7ed1-4024-9b96-e3a1dd24092c.png)
  
   - hard_threshold_patch
   > Move to high-resolution image and find foreground patches using fixed value
+  > 
   > Search foreground only in ROI bounding box
+  > 
   > Return stacked patch in shape of (N,C,H,W) and the format is npy
 
   - full_hardthreshold
   > Similar to 'hard_threshold_patch' but searching whole image
+  > 
   > This is for the cases where ROI bounding box doesn't work well
 
   - view_patch
@@ -81,6 +85,7 @@ python3 preprocessing_mp.py --saveimg
 
   - process
   > This function is called in multiprocessing.pool.map()
+  > 
   > User should choose one method of thresholding in this function
 
 ## check_files.py
