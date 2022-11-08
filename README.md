@@ -9,7 +9,9 @@ python main.py --distributed --amp --workers 4 --batch_size 2
 ```
 - Description 
 > Training code using MIL (Multiple Instance Learning) for WSI (Whole Slide Image) 
+> 
 > Use resnet34 as a backbone and put output feature into (multi-head) self-attention transformer encoder. (This part is implemented in MONAI MILmodel)
+> 
 > Based on MONAI tutorial code for digital pathology
 
 ## myfunc.py
