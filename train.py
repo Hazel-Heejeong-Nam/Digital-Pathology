@@ -1,19 +1,17 @@
 import argparse
-import collections.abc
 import os
 import shutil
 import time
 import random
 import torch.backends.cudnn as cudnn
-
-import gdown
+from torch.nn import functional as F
 import numpy as np
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
 from monai.config import KeysCollection
-from monai.data import PersistentDataset, Dataset, load_decathlon_datalist
+from monai.data import Dataset
 from monai.data.image_reader import NumpyReader
 from monai.metrics import Cumulative, CumulativeAverage
 from monai.networks.nets import milmodel
@@ -28,9 +26,8 @@ from sklearn.metrics import f1_score, roc_auc_score, confusion_matrix, auc, prec
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data.dataloader import default_collate
 from torch.utils.data.distributed import DistributedSampler
-from torch.utils.tensorboard import SummaryWriter
 import torchvision.models.resnet
-from myfunc import *
+from thyroid_utils import *
 
 from torchvision.models.resnet import resnet18, resnet34, resnet50
 
@@ -38,7 +35,6 @@ def train_epoch(model, loader, optimizer, scaler, epoch, args):
     """One train epoch over the dataset"""
 
     model.train()
-
     criterion = nn.BCEWithLogitsLoss()
 
     run_loss = CumulativeAverage()
@@ -60,21 +56,8 @@ def train_epoch(model, loader, optimizer, scaler, epoch, args):
         optimizer.zero_grad(set_to_none=True)
 
         with autocast(enabled=args.amp):
-            # if data.shape[1] > args.max_tile:
-            #     logits = []
-
-            #     for i in range(int(np.ceil(data.shape[1] / float(args.max_tile)))):
-            #         data_slice = data[:, i * args.max_tile : (i + 1) * args.max_tile].cuda(args.rank)
-            #         logits_slice = model(data_slice, no_head=True)
-            #         logits.append(logits_slice)
-            #         del data_slice
-            #     logits = torch.cat(logits, dim=1)
-
-            #     logits = calc_head(logits)
-
-            # else:
             logits = model(data.cuda(args.rank))
-            loss = criterion(logits[0], target)
+            loss = criterion(logits[0],target)
 
         if args.amp:
             scaler.scale(loss).backward()
@@ -110,12 +93,15 @@ def train_epoch(model, loader, optimizer, scaler, epoch, args):
     SCORE = SCORE.get_buffer().cpu().numpy()
     PRE, REC, _ = precision_recall_curve(TARGETS.astype(np.float64),SCORE.astype(np.float64))
 
-    tn, fp, fn, tp = confusion_matrix(TARGETS.astype(np.float64),PREDS.astype(np.float64)).ravel()
+    #tn, fp, fn, tp = confusion_matrix(TARGETS.astype(np.float64),PREDS.astype(np.float64)).ravel()
     f1 = f1_score(TARGETS.astype(np.float64),PREDS.astype(np.float64))
     auroc = roc_auc_score(TARGETS.astype(np.float64),SCORE.astype(np.float64))
     auprc = auc(REC, PRE)
-
-    return loss, acc, f1, auroc, auprc, tn, fp, fn, tp
+    if epoch == args.epochs -1:
+        np.save('train_Targets_fl',TARGETS.astype(np.float64))
+        np.save('train_Preds_fl',PREDS.astype(np.float64))
+        np.save('test_Scores_fl',SCORE.astype(np.float64))
+    return loss, acc, f1, auroc, auprc
 
 def val_epoch(model, loader, epoch, args):
     """One validation epoch over the dataset"""
@@ -125,7 +111,6 @@ def val_epoch(model, loader, epoch, args):
     calc_head = model2.calc_head
 
     criterion = nn.BCEWithLogitsLoss()
-
     run_loss = CumulativeAverage()
     run_acc = CumulativeAverage()
     PREDS = Cumulative()
@@ -144,10 +129,6 @@ def val_epoch(model, loader, epoch, args):
             data = data.permute((0,1,4,2,3)) 
             with autocast(enabled=args.amp):
                 if data.shape[1] > args.max_tile:
-                    # During validation, we want to use all instances/patches
-                    # and if its number is very big, we may run out of GPU memory
-                    # in this case, we first iteratively go over subsets of patches to calculate backbone features
-                    # and at the very end calculate the classification output
 
                     logits = []
 
@@ -164,7 +145,7 @@ def val_epoch(model, loader, epoch, args):
                     # if number of instances is not big, we can run inference directly
                     logits = model(data.cuda(args.rank))
 
-                loss = criterion(logits[0], target)
+                loss = criterion(logits[0],target)
 
             pred = logits>0
             target = target
@@ -194,14 +175,34 @@ def val_epoch(model, loader, epoch, args):
     PRE, REC, _ = precision_recall_curve(TARGETS.astype(np.float64),SCORE.astype(np.float64))
 
     tn, fp, fn, tp = confusion_matrix(TARGETS.astype(np.float64),PREDS.astype(np.float64)).ravel()
+    print(tn, fp, fn, tp)
     f1 = f1_score(TARGETS.astype(np.float64),PREDS.astype(np.float64))
     auroc = roc_auc_score(TARGETS.astype(np.float64),SCORE.astype(np.float64))
     auprc = auc(REC, PRE)
+    if epoch == args.epochs -1:
+        np.save('test_Targets_fl',TARGETS.astype(np.float64))
+        np.save('test_Preds_fl',PREDS.astype(np.float64))
+        np.save('test_Scores_fl',SCORE.astype(np.float64))
+    return loss, acc, f1, auroc, auprc
 
-    return loss, acc, f1, auroc, auprc, tn, fp, fn, tp
 
+#focal loss code from : https://velog.io/@heaseo/Focalloss-%EC%84%A4%EB%AA%85
+# set alpha to 0 
 
-def save_checkpoint(model, epoch, args, filename="model.pt", best_acc=0):
+class WeightedFocalLoss(nn.Module):
+    def __init__(self, alpha=1., gamma=2):
+        super(WeightedFocalLoss, self).__init__()
+        self.alpha = torch.tensor([alpha, 1-alpha]).cuda()
+        self.gamma = gamma
+    def forward(self, inputs, targets):
+        BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+        targets = targets.type(torch.long)
+        at = self.alpha.gather(0, targets.data.view(-1))
+        pt = torch.exp(-BCE_loss)
+        F_loss = at*(1-pt)**self.gamma * BCE_loss
+        return F_loss.mean()
+
+def save_checkpoint(model, epoch, args, filename="model_focalloss.pt", best_acc=0):
     """Save checkpoint"""
 
     state_dict = model.state_dict() if not args.distributed else model.module.state_dict()
@@ -249,22 +250,6 @@ class LabelEncodeIntegerGraded(MapTransform):
         return d
 
 
-# def list_data_collate(batch: collections.abc.Sequence):
-#     """
-#     Combine instances from a list of dicts into a single dict, by stacking them along first dim
-#     [{'image' : 3xHxW}, {'image' : 3xHxW}, {'image' : 3xHxW}...] - > {'image' : Nx3xHxW}
-#     followed by the default collate which will form a batch BxNx3xHxW
-#     """
-
-#     for i, item in enumerate(batch):
-#         # print(f"{i} = {item['image'].shape=} >> {item['image'].keys=}")
-#         data = item[0]
-#         data["image"] = torch.stack([ix["image"] for ix in item], dim=0)
-#         # data["patch_location"] = torch.stack([ix["patch_location"] for ix in item], dim=0)
-#         batch[i] = data
-#     return default_collate(batch)
-
-
 def main_worker(gpu, args):
     args.gpu = gpu
 
@@ -286,13 +271,13 @@ def main_worker(gpu, args):
     if args.rank == 0:
         print("Batch size is:", args.batch_size, "epochs", args.epochs)
 
-    training_list = datalist('train')
-    validation_list = datalist('test')
+    training_list = datalist('train', oversample = 4)
+    validation_list = datalist('test', oversample = 4)
     
     if args.quick:  # for debugging on a small subset
-        training_list = training_list[:160]
+        training_list = training_list[:16]
         validation_list = validation_list[235:251] #라벨 섞여야 auroc 나옴
-        args.epochs = 2
+        args.epochs = 3
 
     transformD = Compose(
         [
@@ -316,7 +301,6 @@ def main_worker(gpu, args):
         pin_memory=True,
         multiprocessing_context="spawn",
         sampler=train_sampler,
-        #collate_fn=list_data_collate,   #npy file 일 때는 필요 없음
     )
     valid_loader = torch.utils.data.DataLoader(
         dataset_valid,
@@ -326,7 +310,6 @@ def main_worker(gpu, args):
         pin_memory=True,
         multiprocessing_context="spawn",
         sampler=val_sampler,
-        #collate_fn=list_data_collate,      #npy file 일 때는 필요 없음
     )
 
     if args.rank == 0:
@@ -354,14 +337,17 @@ def main_worker(gpu, args):
     if args.validate:
         # if we only want to validate existing checkpoint
         epoch_time = time.time()
-        val_loss, val_acc = val_epoch(model, valid_loader, epoch=0, args=args)
+        val_loss, val_acc, val_f1, val_auroc, val_auprc = val_epoch(model, valid_loader, epoch=0, args=args)
         if args.rank == 0:
             print(
-                "Final validation loss: {:.4f}".format(val_loss),
+                "***************Final validation",
+                "loss: {:.4f}".format(val_loss),
                 "acc: {:.4f}".format(val_acc),
-                "time {:.2f}s".format(time.time() - epoch_time),
+                "f1 score: {:.4f}".format(val_f1),
+                "AUROC: {:.4f}".format(val_auroc),
+                "AUPRC: {:.4f}".format(val_auprc),
+                "time {:.2f}s".format(time.time() - epoch_time)
             )
-
         exit(0)
 
     params = model.parameters()
@@ -376,12 +362,12 @@ def main_worker(gpu, args):
     optimizer = torch.optim.AdamW(params, lr=args.optim_lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=0)
 
-    if args.logdir is not None and args.rank == 0:
-        writer = SummaryWriter(log_dir=args.logdir)
-        if args.rank == 0:
-            print("Writing Tensorboard logs to ", writer.log_dir)
-    else:
-        writer = None
+    # if args.logdir is not None and args.rank == 0:
+    #     writer = SummaryWriter(log_dir=args.logdir)
+    #     if args.rank == 0:
+    #         print("Writing Tensorboard logs to ", writer.log_dir)
+    # else:
+    #     writer = None
 
     ###RUN TRAINING
     n_epochs = args.epochs
@@ -400,7 +386,7 @@ def main_worker(gpu, args):
         print(args.rank, time.ctime(), "Epoch:", epoch)
 
         epoch_time = time.time()
-        train_loss, train_acc, train_f1, train_auroc, train_auprc, tn, fp, fn, tp = train_epoch(model, train_loader, optimizer, scaler=scaler, epoch=epoch, args=args)
+        train_loss, train_acc, train_f1, train_auroc, train_auprc = train_epoch(model, train_loader, optimizer, scaler=scaler, epoch=epoch, args=args)
 
         if args.rank == 0:
             print(
@@ -412,12 +398,10 @@ def main_worker(gpu, args):
                 "AUPRC: {:.4f}".format(train_auprc),
                 "time {:.2f}s".format(time.time() - epoch_time),
             )
-            fp_fraction_x = fp/(fp+tn)
-            tp_fraction_x = tp/(tp+fn)
 
-        if args.rank == 0 and writer is not None:
-            writer.add_scalar("train_loss", train_loss, epoch)
-            writer.add_scalar("train_acc", train_acc, epoch)
+        # if args.rank == 0 and writer is not None:
+        #     writer.add_scalar("train_loss", train_loss, epoch)
+        #     writer.add_scalar("train_acc", train_acc, epoch)
 
         if args.distributed:
             torch.distributed.barrier()
@@ -428,7 +412,7 @@ def main_worker(gpu, args):
         if epoch == n_epochs-1:
 
             epoch_time = time.time()
-            val_loss, val_acc, val_f1, val_auroc, val_auprc, tn, fp, fn, tp = val_epoch(model, valid_loader, epoch=epoch, args=args)
+            val_loss, val_acc, val_f1, val_auroc, val_auprc = val_epoch(model, valid_loader, epoch=epoch, args=args)
             if args.rank == 0:
                 print(
                     "***************Final validation  {}/{}".format(epoch, n_epochs - 1),
@@ -439,11 +423,9 @@ def main_worker(gpu, args):
                     "AUPRC: {:.4f}".format(val_auprc),
                     "time {:.2f}s".format(time.time() - epoch_time),
                 )
-                fp_fraction_x = fp/(fp+tn)
-                tp_fraction_x = tp/(tp+fn)
-                if writer is not None:
-                    writer.add_scalar("val_loss", val_loss, epoch)
-                    writer.add_scalar("val_acc", val_acc, epoch)
+                # if writer is not None:
+                #     writer.add_scalar("val_loss", val_loss, epoch)
+                #     writer.add_scalar("val_acc", val_acc, epoch)
 
 
                 if val_acc > val_acc_max:
@@ -452,10 +434,10 @@ def main_worker(gpu, args):
                     b_new_best = True
 
         if args.rank == 0 and args.logdir is not None:
-            save_checkpoint(model, epoch, args, best_acc=val_acc, filename="model_final.pt")
+            save_checkpoint(model, epoch, args, best_acc=val_acc, filename="model_final_over.pt")
             if b_new_best:
                 print("Copying to model.pt new best model!!!!")
-                shutil.copyfile(os.path.join(args.logdir, "model_final.pt"), os.path.join(args.logdir, "model.pt"))
+                shutil.copyfile(os.path.join(args.logdir, "model_final_over.pt"), os.path.join(args.logdir, "model_over.pt"))
 
         scheduler.step()
 
@@ -488,7 +470,7 @@ def parse_args():
 
     parser.add_argument("--logdir", default=None, help="path to log directory to store Tensorboard logs")
 
-    parser.add_argument("--epochs", default=50, type=int, help="number of training epochs")
+    parser.add_argument("--epochs", default=25, type=int, help="number of training epochs")
     parser.add_argument("--batch_size", default=1, type=int, help="batch size, the number of WSI images per gpu")
     parser.add_argument("--optim_lr", default=3e-5, type=float, help="initial learning rate")
 
@@ -525,11 +507,17 @@ def parse_args():
     return args
 
 if __name__ == "__main__":
-
+    random.seed(0)
     args = parse_args()
     args.amp =True
-    args.distributed = True
-    args.quick = True
+    #args.logdir = 'nfs/thena/shared/checkpoints'
+    #args.checkpoint = 'nfs/thena/shared/checkpoints/model_over.pt'
+    #########
+    args.distributed = False
+    #args.quick = False
+    #args.validate = True
+
+
     if args.distributed:
         ngpus_per_node = torch.cuda.device_count()
         args.optim_lr = ngpus_per_node * args.optim_lr / 2  # heuristic to scale up learning rate in multigpu setup
