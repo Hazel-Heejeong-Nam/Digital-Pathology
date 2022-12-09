@@ -1,6 +1,6 @@
 ############## tools for CAMELYON dataset #################
 
-
+import pandas as pd
 import numpy as np
 import openslide
 import cv2
@@ -44,6 +44,13 @@ def patch_generation(args):
             
 def extract_patch(item, args):
     args.imgName = item.split('.')[0]
+    existing_list = os.listdir(os.path.join(args.save_dir, 'CAMELYON{}'.format(args.dataset)))
+    for items in existing_list:
+        isexist = items.find(args.imgName)
+        if isexist != -1:
+            print('pass')
+            return
+    print(item)
     wsi, mask = get_mask(args, item)
     patchbag = mapping(args,wsi, mask)
     if args.saveimg : 
@@ -95,7 +102,6 @@ def mapping(args, wsi, mask):
 
 
 def view_patch(args, patchbag):
-
     patchnum = patchbag.shape[0]
     if patchnum <= 800:
         plt.figure(figsize = (60,20))
@@ -106,7 +112,32 @@ def view_patch(args, patchbag):
         plt.savefig('result/{}_PATCH_{}.png'.format(args.imgName, patchnum))
     else : 
         print('Notification : Too many patches to visualize. Save npy file instead.')
-        np.save('result/{}_PATCH_{}'.format(args.imgName, patchnum), patchbag)
+        #np.save('result/{}_PATCH_{}'.format(args.imgName, patchnum), patchbag)
+  
+  
+  
+def c_datalist(args): 
+    base = os.path.join(args.save_dir, 'CAMELYON{}'.format(args.dataset))
+    list = os.listdir(base)
+    ref = pd.read_csv('reference.csv', names=['name', 'class', 'subclass', 'binary'])
+    train_list = []
+    test_list = []
+    
+    for item in list :
+        if 'test' in item :
+            _class = ref['class'][ref['name'].str.contains(item.split('_patch')[0])]
+            dict = {
+                    "image": os.path.join(base, item) , 
+                    "label": 0 if _class.item() == 'normal' else 1               
+                }
+            test_list.append(dict)
+        else :
+            dict = {
+                    "image": os.path.join(base, item) , 
+                    "label": 0 if 'normal' in item else 1                 
+                }
+            train_list.append(dict)       
+    return train_list, test_list
   
   
   
@@ -125,10 +156,18 @@ def parse_args():
     parser.add_argument("--mpp", default= 1, type = int)
 
     # mode
-    parser.add_argument("--saveimg", default=True, help="Save images during process")
+    parser.add_argument("--saveimg", default=False, help="Save images during process")
     parser.add_argument("--savepatchbag", default = False, help = "Save patchbag.npy to directory")
     parser.add_argument("--multiprocess", default= False)
     parser.add_argument("--mode", default = 'images', type=str)
 
     args = parser.parse_args()
     return args
+
+
+if __name__ =="__main__":
+    args = parse_args()
+    #patch_generation(args)
+    train, test = c_datalist(args)
+    print(train)
+    print(test)
